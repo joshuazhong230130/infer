@@ -4,52 +4,12 @@ import torch
 from torch import nn
 
 from qwen3_config import Qwen3Config
+from layers.layernorm import RMSNorm
+from layers.position_embedding import get_rope
+from layers.sampler import Sampler
+from engine.kv_cache import KVCache
 
 is_prefill = True
-
-class KVCache:
-    def __init__(self, batch_size, num_kv_heads, max_len, head_dim, device, dtype):
-        self.k_cache = torch.zeros((batch_size, num_kv_heads, max_len, head_dim), device=device, dtype=dtype)  # [batch_size, num_kv_heads, max_seq_len, head_dim]
-        self.v_cache = torch.zeros((batch_size, num_kv_heads, max_len, head_dim), device=device, dtype=dtype)  # [batch_size, num_kv_heads, max_seq_len, head_dim]
-        self.current_idx = 0
-        self.max_len = max_len
-
-    def get_kv_for_attention(self, current_k, current_v):
-        if self.current_idx == 0:
-            return current_k, current_v
-        else:
-            past_k = self.k_cache[:, :, : self.current_idx, :]
-            past_v = self.v_cache[:, :, : self.current_idx, :]
-            attn_k = torch.cat((past_k, current_k), dim=2)
-            attn_v = torch.cat((past_v, current_v), dim=2)
-            return attn_k, attn_v
-
-    def update_cache(self, k, v):
-        assert self.current_idx < self.max_len
-        self.k_cache[:, :, self.current_idx : self.current_idx + 1, :] = k
-        self.v_cache[:, :, self.current_idx : self.current_idx + 1, :] = v
-        self.current_idx += 1
-
-    def prefill_kv(self, k, v):
-        # k, v shape : [batch_size, num_kv_heads, tokens, head_dim]
-        prefill_len = k.shape[2] # tokens
-        assert prefill_len <= self.max_len
-        self.k_cache[:, :, :prefill_len, :] = k
-        self.v_cache[:, :, :prefill_len, :] = v
-        self.current_idx = prefill_len
-
-class Sampler(nn.Module):
-
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, logits: torch.Tensor, temperatures: torch.Tensor):
-        temperatures = temperatures.unsqueeze(dim=1)
-        logits = logits.float().div_(temperatures)
-        # equivalent to Gumbel-Max
-        noise = torch.empty_like(logits).exponential_().clamp_min_(1e-10)
-        sample_tokens = torch.argmax(logits - noise.log(), dim=-1, keepdim=True)
-        return sample_tokens
 
 class Qwen3Model(nn.Module):
     def __init__(self, config: Qwen3Config):
@@ -62,22 +22,8 @@ class Qwen3Model(nn.Module):
         ])
         self.final_norm = RMSNorm(config.hidden_size)
         self.out_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False, dtype=config.dtype)
-        
-        if config.head_dim is None:
-            head_dim = config.hidden_size // config.num_attention_heads
-        else:
-            head_dim = config.head_dim
-        
-        cos, sin = compute_rope_params(
-            head_dim=head_dim,
-            theta_base=config.rope_base,
-            context_length=config.context_length
-        )
-        self.register_buffer("cos", cos, persistent=False)
-        self.register_buffer("sin", sin, persistent=False)
-
         self.sampler = Sampler()
-    
+
     def forward(self, input_ids, output_ids):
         inputs_embeds = self.embed_tokens(input_ids)
         hidden_states = inputs_embeds
@@ -92,7 +38,7 @@ class Qwen3Model(nn.Module):
             start_pos = num_tokens - 1
 
         for decoder_layer in self.layers:
-            hidden_states = decoder_layer(hidden_states, mask, self.cos, self.sin, offset=start_pos)
+            hidden_states = decoder_layer(hidden_states, mask, offset=start_pos)
         hidden_states = self.final_norm(hidden_states)
         if is_prefill:
             x = hidden_states[:, -1:, :].contiguous() # hidden state of last token of each seq
@@ -187,16 +133,18 @@ class Qwen3DecoderLayer(nn.Module):
             head_dim=config.head_dim,
             num_kv_groups=config.num_key_value_heads,
             qk_norm=config.qk_norm,
-            dtype=config.dtype
+            dtype=config.dtype,
+            rope_theta=config.rope_base,
+            max_position=config.context_length,
         )
         self.mlp = Qwen3MLP(config)
         self.input_layernorm = RMSNorm(config.hidden_size)
         self.post_attention_layernorm = RMSNorm(config.hidden_size)
     
-    def forward(self, hidden_states, mask, cos, sin, offset=0):
+    def forward(self, hidden_states, mask, offset=0):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, mask, cos, sin, offset)
+        hidden_states = self.self_attn(hidden_states, mask, offset)
         hidden_states = hidden_states + residual
         
         residual = hidden_states
@@ -229,7 +177,9 @@ class GroupedQueryAttention(nn.Module):
         num_kv_groups,
         head_dim=None,
         qk_norm=False,
-        dtype=None
+        dtype=None,
+        rope_theta: float = 10000,
+        max_position: int = 4096 * 32,
     ):
         super().__init__()
         assert num_heads % num_kv_groups == 0, "num_heads must be divisible by num_kv_groups"
@@ -261,10 +211,16 @@ class GroupedQueryAttention(nn.Module):
         # self.register_buffer("V_cache", torch.zeros(1, self.num_kv_groups, 256, self.head_dim))
         # self.cache_index = 0  # 当前已存 token 数
 
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            base=rope_theta,
+            max_position=max_position,
+        )
+
         device = "cuda" if torch.cuda.is_available() else "cpu"
         self.attn_cache = KVCache(1, self.num_kv_groups, 512, self.head_dim, device, dtype=dtype)
 
-    def prefill_step(self, hidden_states, mask, cos, sin):
+    def prefill_step(self, hidden_states, mask):
         b, num_tokens, _ = hidden_states.shape
         
         # Apply projections
@@ -283,8 +239,8 @@ class GroupedQueryAttention(nn.Module):
         if self.k_norm:
             key_states = self.k_norm(key_states)
         # Apply rope
-        query_states = apply_rope(query_states, cos, sin)
-        key_states = apply_rope(key_states, cos, sin)
+        query_states = self.rotary_emb(query_states)
+        key_states = self.rotary_emb(key_states)
 
         # append K/V to cache
         self.attn_cache.prefill_kv(key_states, value_states)
@@ -301,7 +257,7 @@ class GroupedQueryAttention(nn.Module):
         out = self.o_proj(context)
         return out
 
-    def decode_step(self, hidden_states, mask, cos, sin, offset=0):
+    def decode_step(self, hidden_states, offset=0):
         b, num_tokens, _ = hidden_states.shape
 
         assert num_tokens == 1  # only one token forever
@@ -325,10 +281,10 @@ class GroupedQueryAttention(nn.Module):
             key_states = self.k_norm(key_states)
 
         # Apply rope for query
-        query_states = apply_rope(query_states, cos, sin, offset)
+        query_states = self.rotary_emb(query_states, offset)
 
         # Apply rope for key
-        key_states = apply_rope(key_states, cos, sin, offset)  # Xk_BxNxSxH
+        key_states = self.rotary_emb(key_states, offset)  # Xk_BxNxSxH
         # append K/V to cache
         attn_k, attn_v = self.attn_cache.get_kv_for_attention(key_states, value_states)
         self.attn_cache.update_cache(key_states, value_states)
@@ -345,61 +301,9 @@ class GroupedQueryAttention(nn.Module):
         out = self.o_proj(context)
         return out
 
-    def forward(self, hidden_states, mask, cos, sin, offset=0):
+    def forward(self, hidden_states, mask, offset=0):
         b, num_tokens, _ = hidden_states.shape
         if is_prefill:
-            return self.prefill_step(hidden_states, mask, cos, sin)
+            return self.prefill_step(hidden_states, mask)
         else:
-            return self.decode_step(hidden_states, mask, cos, sin, offset)
-
-def compute_rope_params(head_dim, theta_base=10_000, context_length=4096, dtype=torch.float32):
-    assert head_dim % 2 == 0, "Embedding dimension must be even"
-    
-    inv_freq = 1.0 / (theta_base ** (torch.arange(0, head_dim, 2, dtype=dtype)[: (head_dim // 2)].float() / head_dim))
-    positions = torch.arange(context_length, dtype=dtype)
-    angles = positions.unsqueeze(1) * inv_freq.unsqueeze(0) # Shape: [context_length, head_dim // 2]
-    # Expand angles to match head dim
-    angles = torch.cat([angles, angles], dim=1) # Shape: [context_length, head_dim]
-    cos = torch.cos(angles)
-    sin = torch.sin(angles)
-    
-    return cos, sin
-
-def apply_rope(x, cos, sin, offset=0):
-    # x: [batch_size, num_heads, seq_len, head_dim]
-    batch_size, num_heads, seq_len, head_dim = x.shape
-    assert head_dim % 2 == 0, "Head dimension must be even"
-    
-    x1 = x[..., : head_dim // 2]
-    x2 = x[..., head_dim // 2:]
-    
-    cos = cos[offset:offset+seq_len, :].unsqueeze(0).unsqueeze(0)  # Shape: (1, 1, seq_len, head_dim // 2)
-    sin = sin[offset:offset+seq_len, :].unsqueeze(0).unsqueeze(0)
-    
-    rotated = torch.cat((-x2, x1), dim=-1)
-    x_rotated = (x * cos) + (rotated * sin)
-    
-    return x_rotated.to(dtype=x.dtype)
-
-class RMSNorm(nn.Module):
-    def __init__(self, emb_dim, eps=1e-6, bias=False, qwen3_compatible=True):
-        super().__init__()
-        self.eps = eps
-        self.qwen3_compatible = qwen3_compatible
-        self.scale = nn.Parameter(torch.ones(emb_dim))
-        self.shift = nn.Parameter(torch.zeros(emb_dim)) if bias else None
-    
-    def forward(self, x):
-        input_dtype = x.dtype
-        
-        if self.qwen3_compatible:
-            x = x.to(torch.float32)
-        
-        variance = x.pow(2).mean(dim=-1, keepdim=True)
-        norm_x = x * torch.rsqrt(variance + self.eps)
-        norm_x = norm_x * self.scale
-        
-        if self.shift is not None:
-            norm_x = norm_x + self.shift
-        
-        return norm_x.to(input_dtype)
+            return self.decode_step(hidden_states, offset)
