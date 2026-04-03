@@ -1,18 +1,16 @@
 import time
 import torch
-import argparse
 
-from qwen3 import Qwen3Model 
 from tokenizer import Qwen3Tokenizer
+from engine.engine_core import EngineCore
 
 def main(prompt, model_id):
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    model, tok_file, config = Qwen3Model.from_pretrained(model_id)
-    model.to(device)
+    engine_core = EngineCore(model_id)
 
     tokenizer = Qwen3Tokenizer(
-        tokenizer_file_path=tok_file,
+        tokenizer_file_path=engine_core.tok_file,
         add_generation_prompt=True,
         add_thinking=False
     )
@@ -23,18 +21,17 @@ def main(prompt, model_id):
 
     start = time.time()
     
-    output_token_ids = model.generate(
+    output_token_ids = engine_core.generate(
         idx=torch.tensor(input_token_ids, device=device).unsqueeze(0),
-        max_new_tokens=100,
-        context_size=config.context_length,
+        max_new_tokens=200,
         top_k=30,
         temperature=0.6,
         eos_id=tokenizer.eos_token_id
     )
     
     total_time = time.time() - start
-    print(f"Time: {total_time:.2f} sec")
-    print(f"{int(len(output_token_ids[0])/total_time)} tokens/sec")
+    # print(f"Time: {total_time:.2f} sec")
+    # print(f"{int(len(output_token_ids[0])/total_time)} tokens/sec")
     
     
     if torch.cuda.is_available():
