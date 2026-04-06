@@ -9,8 +9,6 @@ from layers.position_embedding import get_rope
 from layers.sampler import Sampler
 from engine.kv_cache import KVCache
 
-is_prefill = True
-
 class Qwen3Model(nn.Module):
     def __init__(self, config: Qwen3Config):
         super().__init__()
@@ -23,28 +21,25 @@ class Qwen3Model(nn.Module):
         self.final_norm = RMSNorm(config.hidden_size)
         self.out_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False, dtype=config.dtype)
 
-    def forward(self, input_ids, num_tokens):
+    def forward(self, input_ids, num_tokens, is_prefill=True):
         inputs_embeds = self.embed_tokens(input_ids)
         hidden_states = inputs_embeds
 
-        mask = torch.triu(torch.ones(num_tokens, num_tokens, device=hidden_states.device, dtype=torch.bool), diagonal=1)
-
-        global is_prefill
+        mask = None
         if is_prefill:
+            mask = torch.triu(torch.ones(num_tokens, num_tokens, device=hidden_states.device, dtype=torch.bool), diagonal=1)
             start_pos = 0
         else:
             start_pos = num_tokens - 1
 
         for decoder_layer in self.layers:
-            hidden_states = decoder_layer(hidden_states, mask, offset=start_pos)
+            hidden_states = decoder_layer(hidden_states, mask, offset=start_pos, is_prefill=is_prefill)
         hidden_states = self.final_norm(hidden_states)
         if is_prefill:
             x = hidden_states[:, -1:, :].contiguous() # hidden state of last token of each seq
         else:
             x = hidden_states
         logits = self.out_head(x.to(self.config.dtype))
-        if is_prefill:
-            is_prefill = False
         return logits
 
 
@@ -66,10 +61,10 @@ class Qwen3DecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size)
         self.post_attention_layernorm = RMSNorm(config.hidden_size)
     
-    def forward(self, hidden_states, mask, offset=0):
+    def forward(self, hidden_states, mask, offset=0, is_prefill=True):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, mask, offset)
+        hidden_states = self.self_attn(hidden_states, mask, offset, is_prefill)
         hidden_states = hidden_states + residual
         
         residual = hidden_states
@@ -187,8 +182,6 @@ class GroupedQueryAttention(nn.Module):
 
         assert num_tokens == 1  # only one token forever
 
-        assert is_prefill == False
-
         # Apply projections
         query_states = self.q_proj(hidden_states) # [b, 1, num_heads * head_dim]
         key_states = self.k_proj(hidden_states) # [b, 1, num_kv_groups * head_dim]
@@ -226,7 +219,7 @@ class GroupedQueryAttention(nn.Module):
         out = self.o_proj(context)
         return out
 
-    def forward(self, hidden_states, mask, offset=0):
+    def forward(self, hidden_states, mask, offset=0, is_prefill=True):
         b, num_tokens, _ = hidden_states.shape
         if is_prefill:
             return self.prefill_step(hidden_states, mask)

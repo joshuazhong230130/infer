@@ -11,7 +11,7 @@ def main(prompt, model_id):
     engine_core = EngineCore(model_id, device)
 
     tokenizer = Qwen3Tokenizer(
-        tokenizer_file_path=engine_core.tok_file,
+        tokenizer_file_path=engine_core.tokenizer_file,
         add_generation_prompt=True,
         add_thinking=False
     )
