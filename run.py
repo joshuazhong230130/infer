@@ -1,13 +1,14 @@
 import time
 import torch
 
+from sample_param import SampleParam
 from tokenizer import Qwen3Tokenizer
 from engine.engine_core import EngineCore
 
 def main(prompt, model_id):
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    engine_core = EngineCore(model_id)
+    engine_core = EngineCore(model_id, device)
 
     tokenizer = Qwen3Tokenizer(
         tokenizer_file_path=engine_core.tok_file,
@@ -15,17 +16,14 @@ def main(prompt, model_id):
         add_thinking=False
     )
 
-    input_token_ids = tokenizer.encode(prompt)
-
+    sample_param = SampleParam(temperature=0.6, top_k=30, max_output_tokens=200)
     torch.manual_seed(123)
 
     start = time.time()
     
     output_token_ids = engine_core.generate(
-        idx=torch.tensor(input_token_ids, device=device).unsqueeze(0),
-        max_new_tokens=200,
-        top_k=30,
-        temperature=0.6,
+        prompt=prompt,
+        sample_param=sample_param,
         eos_id=tokenizer.eos_token_id
     )
     
@@ -39,7 +37,7 @@ def main(prompt, model_id):
         max_mem_gb = max_mem_bytes / (1024 ** 3)
         print(f"Max memory allocated: {max_mem_gb:.2f} GB")
     
-    output_text = tokenizer.decode(output_token_ids.squeeze(0).tolist())
+    output_text = tokenizer.decode(output_token_ids)
     
     print("\n\nOutput text:\n\n", output_text + "...")
 

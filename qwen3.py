@@ -23,11 +23,10 @@ class Qwen3Model(nn.Module):
         self.final_norm = RMSNorm(config.hidden_size)
         self.out_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False, dtype=config.dtype)
 
-    def forward(self, input_ids, output_ids):
+    def forward(self, input_ids, num_tokens):
         inputs_embeds = self.embed_tokens(input_ids)
         hidden_states = inputs_embeds
 
-        num_tokens = output_ids.shape[1]
         mask = torch.triu(torch.ones(num_tokens, num_tokens, device=hidden_states.device, dtype=torch.bool), diagonal=1)
 
         global is_prefill

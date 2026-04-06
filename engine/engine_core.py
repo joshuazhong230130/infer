@@ -1,3 +1,4 @@
+import uuid
 import torch
 import os
 from pathlib import Path
@@ -8,12 +9,24 @@ from qwen3_weight import load_weights_into_qwen
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
 
+from sample_param import SampleParam
+from tokenizer import Qwen3Tokenizer
+from engine.scheduler import Scheduler
+from engine.request import Request
+
 
 class EngineCore:
-    def __init__(self, model_id: str):
+    def __init__(self, model_id: str, device: str = "cuda"):
         self.config = None
+        self.device = device
         self.sampler = Sampler()
         self.load_model(model_id)
+        self.tokenizer = Qwen3Tokenizer(
+            tokenizer_file_path=self.tok_file,
+            add_generation_prompt=True,
+            add_thinking=False
+        )
+        self.scheduler = Scheduler()
 
     def prepare_sample(self, temperature):
         temperatures = []
@@ -22,34 +35,58 @@ class EngineCore:
         temperatures = torch.tensor(temperatures, dtype=torch.float32, device=device)
         return temperatures
 
-    def generate(self, idx, max_new_tokens, temperature=0.0, top_k=None, eos_id=None):
-        output_ids = idx
-        context_size = self.config.context_length
-        for _ in range(max_new_tokens):
-            idx_cond = idx[:, -context_size:]
-            with torch.no_grad():
-                logits = self.model(idx_cond, output_ids)
-            logits = logits[:, -1, :]
-               # New: Filter logits with top_k sampling
-            if top_k is not None:
-                # Keep only top_k values
-                top_logits, _ = torch.topk(logits, top_k)
-                min_val = top_logits[:, -1]
-                logits = torch.where(logits < min_val, torch.tensor(float('-inf')).to(logits.device), logits)
-            # New: Apply temperature scaling
-            token_ids = None
-            if temperature > 0.0:
-                temperatures = self.prepare_sample(temperature)
-                token_ids = self.sampler(logits, temperatures)
+    def add_request(self, prompt: str, sample_param:SampleParam):
+        token_ids = self.tokenizer.encode(prompt)
+        request = Request(request_id=str(uuid.uuid4()), prompt=prompt, token_ids=token_ids, sample_param=sample_param)
+        self.scheduler.add_request(request)
+        return request
+
+    def sampling(self, logits, temperature, top_k=None):
+        # New: Filter logits with top_k sampling
+        if top_k is not None:
+            # Keep only top_k values
+            top_logits, _ = torch.topk(logits, top_k)
+            min_val = top_logits[:, -1]
+            logits = torch.where(logits < min_val, torch.tensor(float('-inf')).to(logits.device), logits)
+        # New: Apply temperature scaling
+        token_ids = None
+        if temperature > 0.0:
+            temperatures = self.prepare_sample(temperature)
+            token_ids = self.sampler(logits, temperatures)
+        else:
+            token_ids = torch.argmax(logits, dim=-1, keepdim=True)  # (batch_size, 1)
+
+        return token_ids
+
+    def step(self):
+        requests, is_prefill = self.scheduler.schedule()
+        token_ids_batch = []
+        for request in requests:
+            if is_prefill:
+                idx = request.token_ids
             else:
-                token_ids = torch.argmax(logits, dim=-1, keepdim=True)  # (batch_size, 1)
+                idx = request.token_ids[-1:]
+            idx=torch.tensor(idx, device=self.device).unsqueeze(0)
+            with torch.no_grad():
+                logits = self.model(idx, len(request.token_ids))
+            logits = logits[:, -1, :]
+            token_id = self.sampling(logits, request.temperature, request.top_k)
+            token_ids_batch.append(token_id)
 
-            if token_ids == eos_id:  # Stop generating early if end-of-sequence token is encountered and eos_id is specified
-                break
+            # if token_id != request.eos_id:  # Stop generating early if end-of-sequence token is encountered and eos_id is specified
+            #     request.token_ids += token_id.squeeze(0).tolist()
 
-            output_ids = torch.cat((output_ids, token_ids), dim=1)
-            idx = token_ids
-    
+        self.scheduler.postprocess(requests, token_ids_batch)
+        output_ids_batch = [request.last_token_id for request in requests if request.is_finished]
+
+        return output_ids_batch
+
+    def generate(self, prompt, sample_param:SampleParam, eos_id: int):
+        self.scheduler.eos_token_id = eos_id
+        request = self.add_request(prompt, sample_param)
+        while not self.scheduler.is_finished():
+            self.step()
+        output_ids = request.token_ids
         return output_ids
 
     def load_model(
@@ -81,6 +118,4 @@ class EngineCore:
                     weights[key] = f.get_tensor(key)
 
         load_weights_into_qwen(self.model, self.config, weights)
-
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model.to(dtype=self.config.dtype, device=device)
+        self.model.to(dtype=self.config.dtype, device=self.device)
