@@ -21,19 +21,12 @@ class Qwen3Model(nn.Module):
         self.final_norm = RMSNorm(config.hidden_size)
         self.out_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False, dtype=config.dtype)
 
-    def forward(self, input_ids, num_tokens, is_prefill=True):
+    def forward(self, input_ids, positions, is_prefill=True):
         inputs_embeds = self.embed_tokens(input_ids)
         hidden_states = inputs_embeds
 
-        mask = None
-        if is_prefill:
-            mask = torch.triu(torch.ones(num_tokens, num_tokens, device=hidden_states.device, dtype=torch.bool), diagonal=1)
-            start_pos = 0
-        else:
-            start_pos = num_tokens - 1
-
         for decoder_layer in self.layers:
-            hidden_states = decoder_layer(hidden_states, mask, offset=start_pos, is_prefill=is_prefill)
+            hidden_states = decoder_layer(hidden_states, positions, is_prefill=is_prefill)
         hidden_states = self.final_norm(hidden_states)
         if is_prefill:
             x = hidden_states[:, -1:, :].contiguous() # hidden state of last token of each seq
@@ -61,10 +54,10 @@ class Qwen3DecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size)
         self.post_attention_layernorm = RMSNorm(config.hidden_size)
     
-    def forward(self, hidden_states, mask, offset=0, is_prefill=True):
+    def forward(self, hidden_states, positions, is_prefill=True):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, mask, offset, is_prefill)
+        hidden_states = self.self_attn(hidden_states, positions, is_prefill)
         hidden_states = hidden_states + residual
         
         residual = hidden_states
@@ -140,9 +133,12 @@ class GroupedQueryAttention(nn.Module):
         device = "cuda" if torch.cuda.is_available() else "cpu"
         self.attn_cache = KVCache(1, self.num_kv_groups, 512, self.head_dim, device, dtype=dtype)
 
-    def prefill_step(self, hidden_states, mask):
+    def prefill_step(self, hidden_states, positions):
         b, num_tokens, _ = hidden_states.shape
-        
+
+        num_mask_tokens = len(positions)
+        mask = torch.triu(torch.ones(num_mask_tokens, num_mask_tokens, device=hidden_states.device, dtype=torch.bool), diagonal=1)
+
         # Apply projections
         query_states = self.q_proj(hidden_states) # [b, num_tokens, num_heads * head_dim]
         key_states = self.k_proj(hidden_states) # [b, num_tokens, num_kv_groups * head_dim]
@@ -159,8 +155,7 @@ class GroupedQueryAttention(nn.Module):
         if self.k_norm:
             key_states = self.k_norm(key_states)
         # Apply rope
-        query_states = self.rotary_emb(query_states)
-        key_states = self.rotary_emb(key_states)
+        query_states, key_states = self.rotary_emb(positions, query_states, key_states)
 
         # append K/V to cache
         self.attn_cache.prefill_kv(key_states, value_states)
@@ -177,7 +172,7 @@ class GroupedQueryAttention(nn.Module):
         out = self.o_proj(context)
         return out
 
-    def decode_step(self, hidden_states, offset=0):
+    def decode_step(self, hidden_states, positions):
         b, num_tokens, _ = hidden_states.shape
 
         assert num_tokens == 1  # only one token forever
@@ -198,11 +193,9 @@ class GroupedQueryAttention(nn.Module):
         if self.k_norm:
             key_states = self.k_norm(key_states)
 
-        # Apply rope for query
-        query_states = self.rotary_emb(query_states, offset)
+        # Apply rope for query, key
+        query_states, key_states = self.rotary_emb(positions, query_states, key_states)
 
-        # Apply rope for key
-        key_states = self.rotary_emb(key_states, offset)  # Xk_BxNxSxH
         # append K/V to cache
         attn_k, attn_v = self.attn_cache.get_kv_for_attention(key_states, value_states)
         self.attn_cache.update_cache(key_states, value_states)
@@ -219,9 +212,8 @@ class GroupedQueryAttention(nn.Module):
         out = self.o_proj(context)
         return out
 
-    def forward(self, hidden_states, mask, offset=0, is_prefill=True):
-        b, num_tokens, _ = hidden_states.shape
+    def forward(self, hidden_states, positions, is_prefill=True):
         if is_prefill:
-            return self.prefill_step(hidden_states, mask)
+            return self.prefill_step(hidden_states, positions)
         else:
-            return self.decode_step(hidden_states, offset)
+            return self.decode_step(hidden_states, positions)

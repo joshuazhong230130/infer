@@ -20,21 +20,23 @@ class ModelRunner:
         self.sampler = Sampler()
         self.load_model(model_id)
 
-    # def prepare_prefill(self, requests: list[Request]):
-    #     input_ids = []
-    #     cu_seqlens = []
-    #     for request in requests:
-    #         input_ids.extend(request.token_ids)
-    #         cu_seqlens.extend([len(request.token_ids)])
-    #     return input_ids, cu_seqlens
+    def prepare_prefill(self, requests: list[Request]):
+        token_ids = []
+        positions = []
+        for request in requests:
+            token_ids.extend(request.token_ids)
+            seq_len = len(request.token_ids)
+            positions.extend(list(range(seq_len)))
+        return token_ids, positions
 
-    # def prepare_decode(self, requests: list[Request]):
-    #     positions = []
-    #     input_ids = []
-    #     for request in requests:
-    #         input_ids.append(request.last_token_id)
-    #         positions.append(len(request.token_ids) - 1)
-    #     return input_ids, positions
+    def prepare_decode(self, requests: list[Request]):
+        token_ids = []
+        positions = []
+        for request in requests:
+            token_ids.append(request.last_token_id)
+            seq_len = len(request.token_ids)
+            positions.append(seq_len - 1)
+        return token_ids, positions
 
     def prepare_sample(self, temperature):
         temperatures = []
@@ -62,16 +64,18 @@ class ModelRunner:
 
     def run(self, requests: list[Request], is_prefill: bool) -> list[int]:
         token_ids_batch = []
-        for request in requests:
-            if is_prefill:
-                input_token_ids=torch.tensor(request.token_ids, device=self.device).unsqueeze(0)
-            else:
-                input_token_ids=torch.tensor([request.last_token_id], device=self.device).unsqueeze(0)
-            with torch.no_grad():
-                logits = self.model(input_token_ids, len(request.token_ids), is_prefill=is_prefill)
-            logits = logits[:, -1, :]
-            token_id = self.sampling(logits, request.temperature, request.top_k)
-            token_ids_batch.append(token_id)
+
+        if is_prefill:
+            token_ids, positions = self.prepare_prefill(requests)
+        else:
+            token_ids, positions = self.prepare_decode(requests)
+        input_token_ids=torch.tensor(token_ids, device=self.device).unsqueeze(0)
+
+        logits = self.model(input_token_ids, positions, is_prefill=is_prefill)
+        logits = logits[:, -1, :]
+        request = requests[0]
+        token_id = self.sampling(logits, request.temperature, request.top_k)
+        token_ids_batch.append(token_id)
 
         return token_ids_batch
 

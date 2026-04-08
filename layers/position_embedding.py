@@ -3,6 +3,19 @@ import torch
 from torch import nn
 from transformers import Qwen3Config
 
+def apply_rotary_emb(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> torch.Tensor:
+    head_dim = x.shape[-1]
+    x1 = x[..., : head_dim // 2]
+    x2 = x[..., head_dim // 2:]
+
+    rotated = torch.cat((-x2, x1), dim=-1)
+    x_rotated = (x * cos) + (rotated * sin) 
+    return x_rotated.to(dtype=x.dtype)
+
 
 class RotaryEmbedding(nn.Module):
     def __init__(
@@ -33,21 +46,15 @@ class RotaryEmbedding(nn.Module):
         
         return cos, sin
 
-    def forward(self, x, offset=0):
+    def forward(self, positions: list[int], query: torch.Tensor, key: torch.Tensor):
         # x: [batch_size, num_heads, seq_len, head_dim]
-        batch_size, num_heads, seq_len, head_dim = x.shape
-        assert head_dim % 2 == 0, "Head dimension must be even"
-        
-        x1 = x[..., : head_dim // 2]
-        x2 = x[..., head_dim // 2:]
-        
-        cos = self.cos[offset:offset+seq_len, :].unsqueeze(0).unsqueeze(0)  # Shape: (1, 1, seq_len, head_dim // 2)
-        sin = self.sin[offset:offset+seq_len, :].unsqueeze(0).unsqueeze(0)
-        
-        rotated = torch.cat((-x2, x1), dim=-1)
-        x_rotated = (x * cos) + (rotated * sin)
-        
-        return x_rotated.to(dtype=x.dtype)
+
+        cos = self.cos[positions].unsqueeze(0).unsqueeze(0)  # Shape: (1, 1, seq_len, head_dim // 2)
+        sin = self.sin[positions].unsqueeze(0).unsqueeze(0)
+
+        query = apply_rotary_emb(query, cos, sin)
+        key = apply_rotary_emb(key, cos, sin)
+        return query, key
 
 @lru_cache(1)
 def get_rope(
