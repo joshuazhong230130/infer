@@ -49,8 +49,8 @@ class RotaryEmbedding(nn.Module):
     def forward(self, positions: list[int], query: torch.Tensor, key: torch.Tensor):
         # x: [batch_size, num_heads, seq_len, head_dim]
 
-        cos = self.cos[positions].unsqueeze(0).unsqueeze(0)  # Shape: (1, 1, seq_len, head_dim // 2)
-        sin = self.sin[positions].unsqueeze(0).unsqueeze(0)
+        cos = self.cos[positions].unsqueeze(1) # Shape: (seq_len, 1, head_dim // 2)
+        sin = self.sin[positions].unsqueeze(1) # Shape: (seq_len, 1, head_dim // 2)
 
         query = apply_rotary_emb(query, cos, sin)
         key = apply_rotary_emb(key, cos, sin)

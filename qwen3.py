@@ -3,6 +3,7 @@ from pathlib import Path
 import torch
 from torch import nn
 
+from layers.attention import attention_with_kvcache, varlen_attention
 from qwen3_config import Qwen3Config
 from layers.layernorm import RMSNorm
 from layers.position_embedding import get_rope
@@ -134,41 +135,41 @@ class GroupedQueryAttention(nn.Module):
         self.attn_cache = KVCache(1, self.num_kv_groups, 512, self.head_dim, device, dtype=dtype)
 
     def prefill_step(self, hidden_states, positions):
-        b, num_tokens, _ = hidden_states.shape
-
-        num_mask_tokens = len(positions)
-        mask = torch.triu(torch.ones(num_mask_tokens, num_mask_tokens, device=hidden_states.device, dtype=torch.bool), diagonal=1)
+        x = hidden_states.squeeze(0)
+        num_tokens = x.shape[0]
 
         # Apply projections
-        query_states = self.q_proj(hidden_states) # [b, num_tokens, num_heads * head_dim]
-        key_states = self.k_proj(hidden_states) # [b, num_tokens, num_kv_groups * head_dim]
-        value_states = self.v_proj(hidden_states) # [b, num_tokens, num_kv_groups * head_dim]
+        query_states = self.q_proj(x) # [total_tokens, num_heads * head_dim]
+        key_states = self.k_proj(x) # [total_tokens, num_kv_groups * head_dim]
+        value_states = self.v_proj(x) # [total_tokens, num_kv_groups * head_dim]
         
         # Reshape
-        query_states = query_states.view(b, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(b, num_tokens, self.num_kv_groups, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(b, num_tokens, self.num_kv_groups, self.head_dim).transpose(1, 2)
-        
+        query_states = query_states.view(-1, self.num_heads, self.head_dim)
+        key_states = key_states.view(-1, self.num_kv_groups, self.head_dim)
+        value_states = value_states.view(-1, self.num_kv_groups, self.head_dim)
+
         # Optional norm
         if self.q_norm:
             query_states = self.q_norm(query_states)
         if self.k_norm:
             key_states = self.k_norm(key_states)
+
         # Apply rope
         query_states, key_states = self.rotary_emb(positions, query_states, key_states)
 
         # append K/V to cache
-        self.attn_cache.prefill_kv(key_states, value_states)
+        k_cache = key_states.unsqueeze(0)
+        v_cache = value_states.unsqueeze(0)
+        self.attn_cache.store_kvcache(k_cache, v_cache)
 
         # Expand K and V to match number of heads
         key_states = key_states.repeat_interleave(self.group_size, dim=1)
         value_states = value_states.repeat_interleave(self.group_size, dim=1)
         # Attention
-        attn_scores = query_states @ key_states.transpose(2, 3)
-        attn_scores = attn_scores.masked_fill(mask, -torch.inf)
-        attn_weights = torch.softmax(attn_scores / self.head_dim**0.5, dim=-1)
-
-        context = (attn_weights @ value_states).transpose(1, 2).reshape(b, num_tokens, self.d_out)
+        cu_seqlens = torch.tensor([0, num_tokens], dtype=torch.int32, device=hidden_states.device)
+        max_seqlen = num_tokens
+        context = varlen_attention(query_states, key_states, value_states, cu_seqlens, max_seqlen, scale=self.head_dim**(-0.5))
+        context = context.reshape(num_tokens, self.d_out)
         out = self.o_proj(context)
         return out
 
@@ -176,16 +177,17 @@ class GroupedQueryAttention(nn.Module):
         b, num_tokens, _ = hidden_states.shape
 
         assert num_tokens == 1  # only one token forever
+        x = hidden_states.squeeze(1)
 
         # Apply projections
-        query_states = self.q_proj(hidden_states) # [b, 1, num_heads * head_dim]
-        key_states = self.k_proj(hidden_states) # [b, 1, num_kv_groups * head_dim]
-        value_states = self.v_proj(hidden_states) # [b, 1, num_kv_groups * head_dim]
+        query_states = self.q_proj(x) # [b, 1, num_heads * head_dim]
+        key_states = self.k_proj(x) # [b, 1, num_kv_groups * head_dim]
+        value_states = self.v_proj(x) # [b, 1, num_kv_groups * head_dim]
         
         # Reshape
-        query_states = query_states.view(b, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(b, num_tokens, self.num_kv_groups, self.head_dim).transpose(1, 2)  # [b, num_kv_groups, num_tokens, head_dim]
-        value_states = value_states.view(b, num_tokens, self.num_kv_groups, self.head_dim).transpose(1, 2)  # Xv_BxNxSxH
+        query_states = query_states.view(b, self.num_heads, self.head_dim) # [b, num_heads, head_dim]
+        key_states = key_states.view(b, self.num_kv_groups, self.head_dim)  # [b, num_kv_groups, head_dim]
+        value_states = value_states.view(b, self.num_kv_groups, self.head_dim)  # [b, num_kv_groups, head_dim]
 
         # Optional norm
         if self.q_norm:
@@ -197,18 +199,16 @@ class GroupedQueryAttention(nn.Module):
         query_states, key_states = self.rotary_emb(positions, query_states, key_states)
 
         # append K/V to cache
-        attn_k, attn_v = self.attn_cache.get_kv_for_attention(key_states, value_states)
-        self.attn_cache.update_cache(key_states, value_states)
+        k_cache, v_cache = self.attn_cache.store_kvcache(key_states.unsqueeze(1), value_states.unsqueeze(1))
 
         # Expand K and V to match number of heads
-        K_repeat = attn_k.repeat_interleave(self.group_size, dim=1)  # [batch_size, num_heads, T, head_dim]
-        V_repeat = attn_v.repeat_interleave(self.group_size, dim=1)
+        k_cache = k_cache.repeat_interleave(self.group_size, dim=2)  # [batch_size, T, num_heads, head_dim]
+        v_cache = v_cache.repeat_interleave(self.group_size, dim=2)  # [batch_size, T, num_heads, head_dim]
 
         # Attention
-        attn_scores = query_states @ K_repeat.transpose(2, 3)
-        attn_weights = torch.softmax(attn_scores / self.head_dim**0.5, dim=-1)
-
-        context = (attn_weights @ V_repeat).transpose(1, 2).reshape(b, num_tokens, self.d_out)
+        cache_seq_lens = torch.tensor([k_cache.shape[1]], dtype=torch.int32, device=hidden_states.device)
+        context = attention_with_kvcache(query_states, k_cache, v_cache, cache_seq_lens=cache_seq_lens, scale=self.head_dim**(-0.5))
+        context = context.reshape(num_tokens, self.d_out)
         out = self.o_proj(context)
         return out
 
